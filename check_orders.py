@@ -140,7 +140,6 @@ def send_slack_message(text):
 
 
 def main():
-    send_slack_message("👋 Test message from Lillomilo Ops Tool — if you see this, Slack is wired up correctly!")  # TEMPORARY TEST LINE
     marketplace_id = os.environ.get("AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER")  # ATVPDKIKX0DER = amazon.com (US)
     state = load_state()
     seen_ids = set(state["notified_order_ids"])
