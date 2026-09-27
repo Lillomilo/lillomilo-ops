@@ -55,6 +55,15 @@ STATE_FILE = "pnl_state.json"
 # completed Monday-Sunday week. Useful for testing.
 FORCE_RUN = os.environ.get("FORCE_RUN", "false").lower() == "true"
 
+# Set this to "true" (via GitHub Actions workflow_dispatch input) to print
+# the raw transaction data Amazon returns into the workflow's log, instead of
+# (or in addition to) posting the usual Slack summary. This is a one-time
+# diagnostic tool: it lets us see exactly what field names and fee-type
+# labels Amazon actually uses for this account, so the category buckets
+# below can be built precisely instead of guessed. This never posts the raw
+# data to Slack - it only ever goes into the private GitHub Actions log.
+DEBUG_DUMP = os.environ.get("DEBUG_DUMP", "false").lower() == "true"
+
 
 # ---------------------------------------------------------------------------
 # Step 1: Figure out if today is a report day, and what period to report on
@@ -206,6 +215,42 @@ def summarize_transactions(transactions):
     return net_total, currency, category_totals
 
 
+def dump_raw_transactions_for_debugging(transactions):
+    """
+    Prints the raw transaction data to the workflow log so we can see the
+    exact field names and fee-type labels Amazon uses for this account, and
+    build accurate categories from real data instead of guessing keywords.
+    Only ever printed to the GitHub Actions log, never sent to Slack.
+    """
+    print(f"\n===== DEBUG DUMP: {len(transactions)} transactions =====\n")
+
+    # Print full detail for the first 20, so we can see the real shape.
+    for i, txn in enumerate(transactions[:20]):
+        print(f"--- transaction {i} ---")
+        print(json.dumps(txn, indent=2, default=str))
+        print()
+
+    # Also collect every distinct transactionType / description-like value
+    # seen across ALL transactions, so we don't miss a fee type that just
+    # didn't happen to show up in the first 20.
+    seen_types = set()
+    for txn in transactions:
+        for key in ("transactionType", "description"):
+            value = txn.get(key)
+            if value:
+                seen_types.add(f"{key}: {value}")
+        breakdowns = txn.get("breakdowns") or []
+        for b in breakdowns:
+            name = b.get("name") or b.get("breakdownType")
+            if name:
+                seen_types.add(f"breakdown name: {name}")
+
+    print("===== All distinct transactionType/description/breakdown values seen =====")
+    for value in sorted(seen_types):
+        print(f"  {value}")
+    print("===== END DEBUG DUMP =====\n")
+
+
 def get_ad_spend(period_start, period_end):
     """
     Placeholder until the Amazon Ads API access is approved and wired up.
@@ -288,6 +333,10 @@ def main():
 
     access_token = get_access_token()
     transactions = fetch_transactions(access_token, period_start, period_end)
+
+    if DEBUG_DUMP:
+        dump_raw_transactions_for_debugging(transactions)
+
     net_total, currency, category_totals = summarize_transactions(transactions)
     ad_spend = get_ad_spend(period_start, period_end)
 
