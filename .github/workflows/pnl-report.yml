@@ -1,0 +1,56 @@
+name: Amazon P&L Slack Report
+on:
+  schedule:
+    # Runs early Monday morning (13:00 UTC = ~9am ET). The script covers the
+    # full Monday-Sunday week that just ended (yesterday), so weekend sales
+    # are always included.
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Force a report to run today (for testing), ignoring the date check"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pnl-report
+  cancel-in-progress: false
+
+jobs:
+  pnl-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run P&L report and notify Slack
+        env:
+          AMAZON_LWA_CLIENT_ID: ${{ secrets.AMAZON_LWA_CLIENT_ID }}
+          AMAZON_LWA_CLIENT_SECRET: ${{ secrets.AMAZON_LWA_CLIENT_SECRET }}
+          AMAZON_REFRESH_TOKEN: ${{ secrets.AMAZON_REFRESH_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          FORCE_RUN: ${{ inputs.force_run }}
+        run: python pnl_report.py
+
+      - name: Save updated state back to the repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pnl_state.json
+          if ! git diff --staged --quiet; then
+            git commit -m "Update P&L report state"
+            git pull --rebase origin main
+            git push
+          fi
