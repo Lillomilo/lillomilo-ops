@@ -17,6 +17,16 @@ on:
         required: false
         default: false
         type: boolean
+      custom_start_date:
+        description: "Optional: run for a custom date range instead (format YYYY-MM-DD), e.g. to check a full month against Seller Central. Leave blank for the normal weekly run."
+        required: false
+        default: ""
+        type: string
+      custom_end_date:
+        description: "End date for the custom range above (format YYYY-MM-DD). Both custom dates must be set together."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -45,9 +55,11 @@ jobs:
           AMAZON_LWA_CLIENT_ID: ${{ secrets.AMAZON_LWA_CLIENT_ID }}
           AMAZON_LWA_CLIENT_SECRET: ${{ secrets.AMAZON_LWA_CLIENT_SECRET }}
           AMAZON_REFRESH_TOKEN: ${{ secrets.AMAZON_REFRESH_TOKEN }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_PNL }}
           FORCE_RUN: ${{ inputs.force_run }}
           DEBUG_DUMP: ${{ inputs.debug_dump }}
+          CUSTOM_START_DATE: ${{ inputs.custom_start_date }}
+          CUSTOM_END_DATE: ${{ inputs.custom_end_date }}
         run: python pnl_report.py
 
       - name: Save updated state back to the repo
