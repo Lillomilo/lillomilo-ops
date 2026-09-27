@@ -180,6 +180,16 @@ def fetch_financial_events(access_token, period_start, period_end):
 # it's a broader/less specific label than the others when both are present.
 TYPE_LABEL_KEYS = ("ChargeType", "FeeType", "AdjustmentType", "PromotionType", "FeeReason", "TransactionType")
 
+# Some events (like a removal-shipment/liquidation event) put an amount
+# directly under a plain, self-descriptive key - e.g. {"FeeAmount": {...},
+# "Revenue": {...}} - with no separate ChargeType/FeeType field nearby to
+# describe it. In that situation only (i.e. nothing more specific was
+# already found on this exact object), the key name itself becomes part of
+# the label, so a "Revenue" amount and a "FeeAmount" amount in the same
+# event show up as two distinct, correctly-signed lines instead of being
+# silently netted together under one generic label.
+SELF_DESCRIPTIVE_AMOUNT_KEYS = {"Revenue", "FeeAmount", "TaxAmount", "TaxWithheld"}
+
 
 def find_currency_amounts(node, current_type_hint=None, current_hint_source=None):
     """
@@ -210,15 +220,26 @@ def find_currency_amounts(node, current_type_hint=None, current_hint_source=None
 
         type_hint = current_type_hint
         hint_source = current_hint_source
+        found_specific_label_here = False
         for key in TYPE_LABEL_KEYS:
             value = node.get(key)
             if isinstance(value, str) and value:
                 type_hint = value
                 hint_source = key
+                found_specific_label_here = True
                 break
 
-        for value in node.values():
-            results.extend(find_currency_amounts(value, type_hint, hint_source))
+        for key, value in node.items():
+            if (
+                not found_specific_label_here
+                and key in SELF_DESCRIPTIVE_AMOUNT_KEYS
+                and isinstance(value, dict)
+                and "CurrencyAmount" in value
+            ):
+                branch_hint = f"{type_hint} ({key})" if type_hint else key
+                results.extend(find_currency_amounts(value, branch_hint, hint_source or key))
+            else:
+                results.extend(find_currency_amounts(value, type_hint, hint_source))
 
     elif isinstance(node, list):
         for item in node:
@@ -377,7 +398,7 @@ CATEGORY_DISPLAY_ORDER = [
 # Categories that are inherently catch-alls - always show what's actually
 # inside them (which specific Amazon fee types) rather than just a lump sum,
 # so nothing is a mystery number.
-CATEGORIES_TO_EXPAND = {"Other fees", "Claims & chargebacks", "Inventory adjustments"}
+CATEGORIES_TO_EXPAND = {"Other fees", "Claims & chargebacks", "Inventory adjustments", "Removal / disposal fees", "Liquidations"}
 
 
 def format_slack_message(label, net_total, currency, category_totals, ad_spend, category_subitems=None):
