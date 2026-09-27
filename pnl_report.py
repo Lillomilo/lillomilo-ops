@@ -264,9 +264,17 @@ def categorize(list_name, type_hint):
 
 
 def summarize_financial_events(events):
+    """
+    Returns (net_total, currency, category_totals, category_subitems).
+    category_subitems breaks each category down further by its specific
+    Amazon type label (e.g. "Other fees" -> {"FixedClosingFee": -5.00,
+    "DigitalServicesFee": -7.34}), so any catch-all category can show
+    exactly what's inside it instead of just a lump sum.
+    """
     net_total = 0.0
     currency = "USD"
     category_totals = {}
+    category_subitems = {}
 
     for list_name, items in events.items():
         for event in items:
@@ -276,7 +284,11 @@ def summarize_financial_events(events):
                 category = categorize(list_name, type_hint)
                 category_totals[category] = category_totals.get(category, 0.0) + amount
 
-    return net_total, currency, category_totals
+                label = type_hint or list_name
+                subitems = category_subitems.setdefault(category, {})
+                subitems[label] = subitems.get(label, 0.0) + amount
+
+    return net_total, currency, category_totals, category_subitems
 
 
 def dump_raw_events_for_debugging(events):
@@ -338,7 +350,14 @@ CATEGORY_DISPLAY_ORDER = [
 ]
 
 
-def format_slack_message(label, net_total, currency, category_totals, ad_spend):
+# Categories that are inherently catch-alls - always show what's actually
+# inside them (which specific Amazon fee types) rather than just a lump sum,
+# so nothing is a mystery number.
+CATEGORIES_TO_EXPAND = {"Other fees", "Claims & chargebacks", "Inventory adjustments"}
+
+
+def format_slack_message(label, net_total, currency, category_totals, ad_spend, category_subitems=None):
+    category_subitems = category_subitems or {}
     lines = [f"*Amazon P&L Snapshot: {label}*", ""]
 
     net_line = f"*Net from Amazon: {net_total:,.2f} {currency}*"
@@ -350,15 +369,22 @@ def format_slack_message(label, net_total, currency, category_totals, ad_spend):
     lines.append(net_line)
     lines.append("")
 
+    def append_category_line(category, amount):
+        lines.append(f"• {category}: {amount:,.2f}")
+        if category in CATEGORIES_TO_EXPAND:
+            subitems = category_subitems.get(category, {})
+            for sub_label, sub_amount in sorted(subitems.items(), key=lambda kv: -abs(kv[1])):
+                lines.append(f"    - {sub_label}: {sub_amount:,.2f}")
+
     lines.append("_Breakdown by category:_")
     for category in CATEGORY_DISPLAY_ORDER:
         if category in category_totals:
-            lines.append(f"• {category}: {category_totals[category]:,.2f}")
+            append_category_line(category, category_totals[category])
     # Catch any category not in our known display order (shouldn't normally
     # happen, but keeps the total honest if Amazon ever adds a new list type)
     for category, amount in category_totals.items():
         if category not in CATEGORY_DISPLAY_ORDER:
-            lines.append(f"• {category}: {amount:,.2f}")
+            append_category_line(category, amount)
 
     lines.append("")
     lines.append("_Note: this does not include cost of goods (COGS) - track that separately._")
@@ -416,10 +442,10 @@ def main():
     if DEBUG_DUMP:
         dump_raw_events_for_debugging(events)
 
-    net_total, currency, category_totals = summarize_financial_events(events)
+    net_total, currency, category_totals, category_subitems = summarize_financial_events(events)
     ad_spend = get_ad_spend(period_start, period_end)
 
-    message = format_slack_message(label, net_total, currency, category_totals, ad_spend)
+    message = format_slack_message(label, net_total, currency, category_totals, ad_spend, category_subitems)
     post_to_slack(message)
     print("Posted to Slack.")
 
