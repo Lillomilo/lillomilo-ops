@@ -12,6 +12,11 @@ on:
         required: false
         default: false
         type: boolean
+      debug_dump:
+        description: "Print raw Amazon fee data into this log (private, not posted to Slack) to help refine categories"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -42,6 +47,7 @@ jobs:
           AMAZON_REFRESH_TOKEN: ${{ secrets.AMAZON_REFRESH_TOKEN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           FORCE_RUN: ${{ inputs.force_run }}
+          DEBUG_DUMP: ${{ inputs.debug_dump }}
         run: python pnl_report.py
 
       - name: Save updated state back to the repo
