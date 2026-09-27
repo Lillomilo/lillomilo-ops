@@ -4,11 +4,11 @@ Amazon P&L Snapshot -> Slack
 Runs once a day (via GitHub Actions cron). Most days it does nothing.
 Every Monday, it:
   1. Gets a fresh Amazon access token using your existing SP-API refresh token
-  2. Pulls every financial transaction (sales, fees, refunds, etc.) from
-     Amazon's Finances API for the full week (Monday - Sunday) that just
-     ended yesterday
-  3. Adds up the totals into a simple bottom-line number (no COGS - that's
-     tracked manually by Davis outside this tool)
+  2. Pulls every financial event (sales, fees, refunds, etc.) from Amazon's
+     Finances API for the full week (Monday - Sunday) that just ended
+     yesterday
+  3. Adds up the totals into a bottom-line number and a breakdown by fee
+     type (no COGS - that's tracked manually by Davis outside this tool)
   4. Posts a readable summary to Slack
 
 Why Monday, and why a full Mon-Sun week: Davis reviews things on Saturday
@@ -20,14 +20,27 @@ weekend included - it'll be a few days old by the following Saturday, but
 it's never missing the most important days. You can still manually trigger
 a same-day run any time via "Run workflow" with force_run checked.
 
-This intentionally does NOT try to perfectly categorize every single Amazon
-fee type. Amazon's fee breakdown is messy and changes often. Instead:
-  - The bottom-line "Net from Amazon" number is trustworthy, because it's
-    just adding up every transaction's total amount - nothing is guessed.
-  - The category breakdown underneath it (Sales, FBA fees, Referral fees,
-    Refunds, Other) is a best-effort grouping based on keywords in each
-    transaction, labeled "approximate" so it's never mistaken for exact
-    accounting.
+Which Amazon API this uses, and why: Amazon actually has two different
+Finances endpoints. The newer "2024-06-19/transactions" endpoint only gives
+a simplified two-bucket view (just "Sales" vs "Expenses" - not useful for a
+real breakdown). This script instead uses the older, more detailed
+"v0/financialEvents" endpoint, which organizes everything into named lists
+(ShipmentEventList for sales/order-level fees, ServiceFeeEventList for
+account-level fees like storage, RefundEventList for refunds, etc.) with
+each individual fee itemized by type (e.g. "Commission" = referral fee,
+"FBAPerUnitFulfillmentFee" = FBA fee, "Storage Fee", and so on).
+
+How the totals stay trustworthy even if a category label is ever wrong:
+  - `find_currency_amounts()` recursively scans every event for every
+    dollar amount it contains, regardless of exactly where it's nested.
+    This means the bottom-line "Net from Amazon" number will always include
+    every dollar Amazon reports, even if some individual item ends up
+    mis-labeled in the breakdown below it.
+  - `categorize()` then labels each amount found (Sales, Refunds, FBA fees,
+    Referral fees, Storage/inventory fees, etc.) based on the specific
+    field names Amazon uses (ChargeType, FeeType, FeeReason, AdjustmentType)
+    and which list it came from. Anything that doesn't clearly match a
+    known type falls into "Other fees" rather than being dropped.
 
 Ad spend is included as a placeholder for now (get_ad_spend) since the
 Amazon Ads API access is still pending approval. Once that's live, that one
@@ -46,7 +59,7 @@ from datetime import datetime, timedelta, timezone
 
 LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token"
 SPAPI_BASE_URL = "https://sellingpartnerapi-na.amazon.com"
-FINANCES_TRANSACTIONS_PATH = "/finances/2024-06-19/transactions"
+FINANCIAL_EVENTS_PATH = "/finances/v0/financialEvents"
 
 STATE_FILE = "pnl_state.json"
 
@@ -56,12 +69,10 @@ STATE_FILE = "pnl_state.json"
 FORCE_RUN = os.environ.get("FORCE_RUN", "false").lower() == "true"
 
 # Set this to "true" (via GitHub Actions workflow_dispatch input) to print
-# the raw transaction data Amazon returns into the workflow's log, instead of
-# (or in addition to) posting the usual Slack summary. This is a one-time
-# diagnostic tool: it lets us see exactly what field names and fee-type
-# labels Amazon actually uses for this account, so the category buckets
-# below can be built precisely instead of guessed. This never posts the raw
-# data to Slack - it only ever goes into the private GitHub Actions log.
+# the raw financial event data into the workflow's log (private, never sent
+# to Slack), plus a per-list/per-category count-and-total summary. Useful
+# any time the category breakdown looks off and we want to see exactly
+# what Amazon actually sent back.
 DEBUG_DUMP = os.environ.get("DEBUG_DUMP", "false").lower() == "true"
 
 
@@ -114,140 +125,185 @@ def get_access_token():
     return resp.json()["access_token"]
 
 
-def fetch_transactions(access_token, period_start, period_end):
+def fetch_financial_events(access_token, period_start, period_end):
     """
-    Pulls every financial transaction posted in the given date range,
-    following pagination until there's no more data.
+    Pulls every financial event posted in the given date range from the
+    v0/financialEvents endpoint, following pagination until there's no more
+    data, and merges every page's named lists (ShipmentEventList,
+    ServiceFeeEventList, RefundEventList, etc.) into one combined dict of
+    {list_name: [event, event, ...]}.
     """
     headers = {"x-amz-access-token": access_token}
     posted_after = period_start.strftime("%Y-%m-%dT00:00:00Z")
     posted_before = (period_end + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
 
-    transactions = []
+    combined_events = {}
     next_token = None
 
     while True:
         params = {
-            "postedAfter": posted_after,
-            "postedBefore": posted_before,
+            "PostedAfter": posted_after,
+            "PostedBefore": posted_before,
+            "MaxResultsPerPage": 100,
         }
         if next_token:
-            params = {"nextToken": next_token}
+            params = {"NextToken": next_token}
 
         resp = requests.get(
-            SPAPI_BASE_URL + FINANCES_TRANSACTIONS_PATH,
+            SPAPI_BASE_URL + FINANCIAL_EVENTS_PATH,
             headers=headers,
             params=params,
             timeout=30,
         )
         resp.raise_for_status()
-        payload = resp.json()
+        payload = resp.json().get("payload", {})
+        events = payload.get("FinancialEvents", {}) or {}
 
-        batch = payload.get("transactions", payload.get("payload", {}).get("transactions", []))
-        transactions.extend(batch)
+        for list_name, items in events.items():
+            if isinstance(items, list) and items:
+                combined_events.setdefault(list_name, []).extend(items)
 
-        next_token = payload.get("nextToken") or payload.get("payload", {}).get("nextToken")
+        next_token = payload.get("NextToken")
         if not next_token:
             break
 
-    return transactions
+    return combined_events
 
 
 # ---------------------------------------------------------------------------
 # Step 3: Add everything up
 # ---------------------------------------------------------------------------
 
-CATEGORY_KEYWORDS = {
-    "Sales": ["order", "sale", "shipment", "product charge"],
-    "Refunds": ["refund", "return", "chargeback", "reversal"],
-    "FBA fees": ["fba", "fulfillment", "storage", "removal", "disposal"],
-    "Referral fees": ["referral", "commission"],
-    "Advertising": ["advertising", "sponsored", "cpc"],
-}
+# Field names Amazon uses, at various nesting depths, to label what kind of
+# charge/fee/adjustment a dollar amount represents.
+TYPE_LABEL_KEYS = ("ChargeType", "FeeType", "AdjustmentType", "PromotionType", "FeeReason")
 
 
-def categorize(description):
-    if not description:
-        return "Other"
-    desc_lower = description.lower()
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(kw in desc_lower for kw in keywords):
-            return category
-    return "Other"
-
-
-def extract_amount(transaction):
+def find_currency_amounts(node, current_type_hint=None):
     """
-    Handles a couple of possible shapes the Finances API total amount can
-    come back in, since Amazon's exact field naming can vary by endpoint
-    version.
+    Recursively walks one financial event (an arbitrarily nested dict/list
+    structure) and yields (amount, currency, type_hint) for every dollar
+    amount found in it - regardless of exactly how deep it's nested. This is
+    what keeps the bottom-line total trustworthy: every CurrencyAmount in the
+    event gets counted, even if the category label ends up imperfect.
+    `type_hint` is the nearest ChargeType/FeeType/AdjustmentType/FeeReason
+    label found on the way down, used later to categorize this amount.
     """
-    total = transaction.get("totalAmount") or transaction.get("total") or {}
-    if isinstance(total, dict):
-        amount = total.get("currencyAmount", total.get("amount"))
-        currency = total.get("currencyCode", "USD")
-    else:
-        amount = total
-        currency = "USD"
-    try:
-        return float(amount), currency
-    except (TypeError, ValueError):
-        return 0.0, currency
+    results = []
+
+    if isinstance(node, dict):
+        if "CurrencyAmount" in node:
+            try:
+                amount = float(node["CurrencyAmount"])
+                currency = node.get("CurrencyCode", "USD")
+                results.append((amount, currency, current_type_hint))
+            except (TypeError, ValueError):
+                pass
+            return results  # a currency-amount dict has nothing further useful inside it
+
+        type_hint = current_type_hint
+        for key in TYPE_LABEL_KEYS:
+            value = node.get(key)
+            if isinstance(value, str) and value:
+                type_hint = value
+                break
+
+        for value in node.values():
+            results.extend(find_currency_amounts(value, type_hint))
+
+    elif isinstance(node, list):
+        for item in node:
+            results.extend(find_currency_amounts(item, current_type_hint))
+
+    return results
 
 
-def summarize_transactions(transactions):
+def categorize(list_name, type_hint):
+    """
+    Labels one dollar amount based on which named list it came from (most
+    reliable signal) and, for the two list types that mix several things
+    together (ShipmentEventList, ServiceFeeEventList), the specific
+    ChargeType/FeeType/FeeReason found near it.
+    """
+    hint = (type_hint or "").lower()
+
+    if list_name == "RefundEventList":
+        return "Refunds"
+    if list_name in ("GuaranteeClaimEventList", "ChargebackEventList"):
+        return "Claims & chargebacks"
+    if list_name == "FBALiquidationEventList":
+        return "Liquidations"
+    if list_name == "CouponPaymentEventList":
+        return "Coupons"
+    if list_name == "AdjustmentEventList":
+        return "Inventory adjustments"
+    if list_name == "TaxWithholdingEventList":
+        return "Taxes withheld"
+
+    if list_name == "ServiceFeeEventList":
+        if "storage" in hint:
+            return "Storage / inventory fees"
+        if "subscription" in hint:
+            return "Subscription fee"
+        if "removal" in hint or "disposal" in hint:
+            return "Removal / disposal fees"
+        return "Other fees"
+
+    if list_name == "ShipmentEventList":
+        if "commission" in hint:
+            return "Referral fees"
+        if "fba" in hint or "fulfillment" in hint:
+            return "FBA fees"
+        if "tax" in hint:
+            return "Taxes collected"
+        if not hint or "principal" in hint or "shipping" in hint or "giftwrap" in hint:
+            return "Sales"
+        return "Other fees"
+
+    return "Other fees"
+
+
+def summarize_financial_events(events):
     net_total = 0.0
     currency = "USD"
     category_totals = {}
 
-    for txn in transactions:
-        amount, currency = extract_amount(txn)
-        net_total += amount
-
-        description = (
-            txn.get("description")
-            or txn.get("transactionType")
-            or ""
-        )
-        category = categorize(description)
-        category_totals[category] = category_totals.get(category, 0.0) + amount
+    for list_name, items in events.items():
+        for event in items:
+            for amount, cur, type_hint in find_currency_amounts(event):
+                net_total += amount
+                currency = cur or currency
+                category = categorize(list_name, type_hint)
+                category_totals[category] = category_totals.get(category, 0.0) + amount
 
     return net_total, currency, category_totals
 
 
-def dump_raw_transactions_for_debugging(transactions):
+def dump_raw_events_for_debugging(events):
     """
-    Prints the raw transaction data to the workflow log so we can see the
-    exact field names and fee-type labels Amazon uses for this account, and
-    build accurate categories from real data instead of guessing keywords.
-    Only ever printed to the GitHub Actions log, never sent to Slack.
+    Prints the raw financial event data (and a per-list amount summary) to
+    the workflow log so we can double check the category breakdown against
+    real data. Only ever printed to the GitHub Actions log, never sent to
+    Slack.
     """
-    print(f"\n===== DEBUG DUMP: {len(transactions)} transactions =====\n")
+    total_events = sum(len(items) for items in events.values())
+    print(f"\n===== DEBUG DUMP: {total_events} events across {len(events)} list types =====\n")
 
-    # Print full detail for the first 20, so we can see the real shape.
-    for i, txn in enumerate(transactions[:20]):
-        print(f"--- transaction {i} ---")
-        print(json.dumps(txn, indent=2, default=str))
+    for list_name, items in events.items():
+        print(f"--- {list_name}: {len(items)} event(s), showing up to 3 ---")
+        for event in items[:3]:
+            print(json.dumps(event, indent=2, default=str))
         print()
 
-    # Also collect every distinct transactionType / description-like value
-    # seen across ALL transactions, so we don't miss a fee type that just
-    # didn't happen to show up in the first 20.
-    seen_types = set()
-    for txn in transactions:
-        for key in ("transactionType", "description"):
-            value = txn.get(key)
-            if value:
-                seen_types.add(f"{key}: {value}")
-        breakdowns = txn.get("breakdowns") or []
-        for b in breakdowns:
-            name = b.get("name") or b.get("breakdownType")
-            if name:
-                seen_types.add(f"breakdown name: {name}")
-
-    print("===== All distinct transactionType/description/breakdown values seen =====")
-    for value in sorted(seen_types):
-        print(f"  {value}")
+    print("===== Per-list totals and category labels found =====")
+    for list_name, items in events.items():
+        list_total = 0.0
+        labels_seen = set()
+        for event in items:
+            for amount, _cur, type_hint in find_currency_amounts(event):
+                list_total += amount
+                labels_seen.add(type_hint or "(no type label)")
+        print(f"  {list_name}: {len(items)} event(s), total {list_total:,.2f}, labels: {sorted(labels_seen)}")
     print("===== END DEBUG DUMP =====\n")
 
 
@@ -264,6 +320,24 @@ def get_ad_spend(period_start, period_end):
 # Step 4: Slack formatting + sending
 # ---------------------------------------------------------------------------
 
+CATEGORY_DISPLAY_ORDER = [
+    "Sales",
+    "Refunds",
+    "FBA fees",
+    "Referral fees",
+    "Storage / inventory fees",
+    "Removal / disposal fees",
+    "Subscription fee",
+    "Inventory adjustments",
+    "Claims & chargebacks",
+    "Liquidations",
+    "Coupons",
+    "Taxes collected",
+    "Taxes withheld",
+    "Other fees",
+]
+
+
 def format_slack_message(label, net_total, currency, category_totals, ad_spend):
     lines = [f"*Amazon P&L Snapshot: {label}*", ""]
 
@@ -276,10 +350,15 @@ def format_slack_message(label, net_total, currency, category_totals, ad_spend):
     lines.append(net_line)
     lines.append("")
 
-    lines.append("_Approximate breakdown (best-effort, not exact accounting):_")
-    for category in ["Sales", "Refunds", "FBA fees", "Referral fees", "Advertising", "Other"]:
+    lines.append("_Breakdown by category:_")
+    for category in CATEGORY_DISPLAY_ORDER:
         if category in category_totals:
             lines.append(f"• {category}: {category_totals[category]:,.2f}")
+    # Catch any category not in our known display order (shouldn't normally
+    # happen, but keeps the total honest if Amazon ever adds a new list type)
+    for category, amount in category_totals.items():
+        if category not in CATEGORY_DISPLAY_ORDER:
+            lines.append(f"• {category}: {amount:,.2f}")
 
     lines.append("")
     lines.append("_Note: this does not include cost of goods (COGS) - track that separately._")
@@ -332,12 +411,12 @@ def main():
     print(f"Running P&L report for {label}...")
 
     access_token = get_access_token()
-    transactions = fetch_transactions(access_token, period_start, period_end)
+    events = fetch_financial_events(access_token, period_start, period_end)
 
     if DEBUG_DUMP:
-        dump_raw_transactions_for_debugging(transactions)
+        dump_raw_events_for_debugging(events)
 
-    net_total, currency, category_totals = summarize_transactions(transactions)
+    net_total, currency, category_totals = summarize_financial_events(events)
     ad_spend = get_ad_spend(period_start, period_end)
 
     message = format_slack_message(label, net_total, currency, category_totals, ad_spend)
