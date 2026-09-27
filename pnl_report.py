@@ -159,13 +159,28 @@ def fetch_financial_events(access_token, period_start, period_end):
     data, and merges every page's named lists (ShipmentEventList,
     ServiceFeeEventList, RefundEventList, etc.) into one combined dict of
     {list_name: [event, event, ...]}.
+
+    De-duplicates across pages: Amazon's Finances API can occasionally
+    return the same event again at the start of the next page - this
+    happens when many events share the exact same PostedDate timestamp
+    (very common, since fees/sales post in batch runs), which can confuse
+    the pagination cursor. Without de-duplication this silently double
+    (or triple) counts a handful of events on every run, which was
+    previously inflating the "Sales" total. Each event is fingerprinted by
+    its full contents (a sorted JSON dump) so an exact repeat is dropped
+    rather than counted again - a genuinely distinct event will never
+    have byte-identical contents to another, since real events always
+    differ by order ID, amount, or timestamp.
     """
     headers = {"x-amz-access-token": access_token}
     posted_after = period_start.strftime("%Y-%m-%dT00:00:00Z")
     posted_before = (period_end + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
 
     combined_events = {}
+    seen_fingerprints = {}
     next_token = None
+    total_seen = 0
+    total_kept = 0
 
     while True:
         params = {
@@ -188,11 +203,27 @@ def fetch_financial_events(access_token, period_start, period_end):
 
         for list_name, items in events.items():
             if isinstance(items, list) and items:
-                combined_events.setdefault(list_name, []).extend(items)
+                bucket = combined_events.setdefault(list_name, [])
+                seen = seen_fingerprints.setdefault(list_name, set())
+                for item in items:
+                    total_seen += 1
+                    fingerprint = json.dumps(item, sort_keys=True, default=str)
+                    if fingerprint in seen:
+                        continue
+                    seen.add(fingerprint)
+                    bucket.append(item)
+                    total_kept += 1
 
         next_token = payload.get("NextToken")
         if not next_token:
             break
+
+    duplicates_dropped = total_seen - total_kept
+    if duplicates_dropped:
+        print(
+            f"Note: Amazon's API returned {duplicates_dropped} duplicate "
+            f"event(s) across pagination pages; de-duplicated before totaling."
+        )
 
     return combined_events
 
