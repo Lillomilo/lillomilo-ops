@@ -175,19 +175,26 @@ def fetch_financial_events(access_token, period_start, period_end):
 # ---------------------------------------------------------------------------
 
 # Field names Amazon uses, at various nesting depths, to label what kind of
-# charge/fee/adjustment a dollar amount represents.
-TYPE_LABEL_KEYS = ("ChargeType", "FeeType", "AdjustmentType", "PromotionType", "FeeReason")
+# charge/fee/adjustment a dollar amount represents. Order matters: the first
+# one found on a given object wins. TransactionType is checked last since
+# it's a broader/less specific label than the others when both are present.
+TYPE_LABEL_KEYS = ("ChargeType", "FeeType", "AdjustmentType", "PromotionType", "FeeReason", "TransactionType")
 
 
-def find_currency_amounts(node, current_type_hint=None):
+def find_currency_amounts(node, current_type_hint=None, current_hint_source=None):
     """
     Recursively walks one financial event (an arbitrarily nested dict/list
-    structure) and yields (amount, currency, type_hint) for every dollar
-    amount found in it - regardless of exactly how deep it's nested. This is
-    what keeps the bottom-line total trustworthy: every CurrencyAmount in the
-    event gets counted, even if the category label ends up imperfect.
-    `type_hint` is the nearest ChargeType/FeeType/AdjustmentType/FeeReason
-    label found on the way down, used later to categorize this amount.
+    structure) and yields (amount, currency, type_hint, hint_source) for
+    every dollar amount found in it - regardless of exactly how deep it's
+    nested. This is what keeps the bottom-line total trustworthy: every
+    CurrencyAmount in the event gets counted, even if the category label
+    ends up imperfect.
+    `type_hint` is the nearest label value found on the way down (e.g.
+    "Commission", "GiftwrapChargeback"). `hint_source` is which *field*
+    produced it (e.g. "FeeType" vs "ChargeType" vs "PromotionType") - this
+    matters because the same word (like "giftwrap") can appear in both a
+    real charge (revenue) and an unrelated fee, so knowing which field it
+    came from disambiguates them correctly.
     """
     results = []
 
@@ -196,34 +203,40 @@ def find_currency_amounts(node, current_type_hint=None):
             try:
                 amount = float(node["CurrencyAmount"])
                 currency = node.get("CurrencyCode", "USD")
-                results.append((amount, currency, current_type_hint))
+                results.append((amount, currency, current_type_hint, current_hint_source))
             except (TypeError, ValueError):
                 pass
             return results  # a currency-amount dict has nothing further useful inside it
 
         type_hint = current_type_hint
+        hint_source = current_hint_source
         for key in TYPE_LABEL_KEYS:
             value = node.get(key)
             if isinstance(value, str) and value:
                 type_hint = value
+                hint_source = key
                 break
 
         for value in node.values():
-            results.extend(find_currency_amounts(value, type_hint))
+            results.extend(find_currency_amounts(value, type_hint, hint_source))
 
     elif isinstance(node, list):
         for item in node:
-            results.extend(find_currency_amounts(item, current_type_hint))
+            results.extend(find_currency_amounts(item, current_type_hint, current_hint_source))
 
     return results
 
 
-def categorize(list_name, type_hint):
+def categorize(list_name, type_hint, hint_source):
     """
     Labels one dollar amount based on which named list it came from (most
-    reliable signal) and, for the two list types that mix several things
-    together (ShipmentEventList, ServiceFeeEventList), the specific
-    ChargeType/FeeType/FeeReason found near it.
+    reliable signal), and for the list types that mix several things
+    together (ShipmentEventList, ServiceFeeEventList), which specific field
+    (hint_source) and value (type_hint) was found near it. Using
+    hint_source - not just keyword-matching the value - is what correctly
+    tells apart e.g. a real "GiftWrap" charge (revenue) from a
+    "GiftwrapChargeback" fee, since both contain the word "giftwrap" but
+    come from different fields (ChargeType vs FeeType).
     """
     hint = (type_hint or "").lower()
 
@@ -237,6 +250,8 @@ def categorize(list_name, type_hint):
         return "Coupons"
     if list_name == "AdjustmentEventList":
         return "Inventory adjustments"
+    if list_name == "RemovalShipmentEventList":
+        return "Removal / disposal fees"
     if list_name == "TaxWithholdingEventList":
         return "Taxes withheld"
 
@@ -250,13 +265,21 @@ def categorize(list_name, type_hint):
         return "Other fees"
 
     if list_name == "ShipmentEventList":
-        if "commission" in hint:
-            return "Referral fees"
-        if "fba" in hint or "fulfillment" in hint:
-            return "FBA fees"
-        if "tax" in hint:
-            return "Taxes collected"
-        if not hint or "principal" in hint or "shipping" in hint or "giftwrap" in hint:
+        if hint_source == "PromotionType":
+            return "Promotions / discounts"
+        if hint_source == "FeeType":
+            if "commission" in hint:
+                return "Referral fees"
+            if "fba" in hint or "fulfillment" in hint:
+                return "FBA fees"
+            return "Other fees"  # e.g. FixedClosingFee, VariableClosingFee, DigitalServicesFee, GiftwrapChargeback
+        if hint_source == "ChargeType":
+            if "tax" in hint:
+                return "Taxes collected"
+            if "principal" in hint or "shipping" in hint or "giftwrap" in hint:
+                return "Sales"
+            return "Other fees"
+        if not hint_source:
             return "Sales"
         return "Other fees"
 
@@ -278,10 +301,10 @@ def summarize_financial_events(events):
 
     for list_name, items in events.items():
         for event in items:
-            for amount, cur, type_hint in find_currency_amounts(event):
+            for amount, cur, type_hint, hint_source in find_currency_amounts(event):
                 net_total += amount
                 currency = cur or currency
-                category = categorize(list_name, type_hint)
+                category = categorize(list_name, type_hint, hint_source)
                 category_totals[category] = category_totals.get(category, 0.0) + amount
 
                 label = type_hint or list_name
@@ -312,7 +335,7 @@ def dump_raw_events_for_debugging(events):
         list_total = 0.0
         labels_seen = set()
         for event in items:
-            for amount, _cur, type_hint in find_currency_amounts(event):
+            for amount, _cur, type_hint, _hint_source in find_currency_amounts(event):
                 list_total += amount
                 labels_seen.add(type_hint or "(no type label)")
         print(f"  {list_name}: {len(items)} event(s), total {list_total:,.2f}, labels: {sorted(labels_seen)}")
@@ -334,6 +357,7 @@ def get_ad_spend(period_start, period_end):
 
 CATEGORY_DISPLAY_ORDER = [
     "Sales",
+    "Promotions / discounts",
     "Refunds",
     "FBA fees",
     "Referral fees",
