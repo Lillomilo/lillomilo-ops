@@ -75,6 +75,15 @@ FORCE_RUN = os.environ.get("FORCE_RUN", "false").lower() == "true"
 # what Amazon actually sent back.
 DEBUG_DUMP = os.environ.get("DEBUG_DUMP", "false").lower() == "true"
 
+# Set both of these (via GitHub Actions workflow_dispatch inputs) to run the
+# report for a specific custom date range instead of the normal weekly
+# window - e.g. to check a full calendar month against Seller Central's own
+# reports. Format: YYYY-MM-DD. A custom-range run always executes (like
+# FORCE_RUN) and never touches pnl_state.json, so it can't interfere with
+# the normal Monday schedule.
+CUSTOM_START_DATE = os.environ.get("CUSTOM_START_DATE", "").strip()
+CUSTOM_END_DATE = os.environ.get("CUSTOM_END_DATE", "").strip()
+
 
 # ---------------------------------------------------------------------------
 # Step 1: Figure out if today is a report day, and what period to report on
@@ -100,7 +109,25 @@ def get_report_period(today, forced=False):
     return start, end, label
 
 
+def get_custom_period():
+    """
+    Parses CUSTOM_START_DATE / CUSTOM_END_DATE into a (start, end, label)
+    period, for validating against Seller Central's own reports over
+    whatever range you choose (a full month, a specific week, etc).
+    """
+    start = datetime.strptime(CUSTOM_START_DATE, "%Y-%m-%d")
+    end = datetime.strptime(CUSTOM_END_DATE, "%Y-%m-%d")
+    label = f"{start.strftime('%b %-d')} - {end.strftime('%b %-d, %Y')} (custom range test)"
+    return start, end, label
+
+
+def has_custom_range():
+    return bool(CUSTOM_START_DATE and CUSTOM_END_DATE)
+
+
 def should_run_today(today):
+    if has_custom_range():
+        return True
     if FORCE_RUN:
         return True
     return today.weekday() == 0  # Monday
@@ -403,25 +430,41 @@ CATEGORIES_TO_EXPAND = {"Other fees", "Claims & chargebacks", "Inventory adjustm
 
 def format_slack_message(label, net_total, currency, category_totals, ad_spend, category_subitems=None):
     category_subitems = category_subitems or {}
+    sales_total = category_totals.get("Sales", 0.0)
+
+    def pct_of_sales(amount):
+        if not sales_total:
+            return None
+        return amount / sales_total * 100
+
     lines = [f"*Amazon P&L Snapshot: {label}*", ""]
 
     net_line = f"*Net from Amazon: {net_total:,.2f} {currency}*"
+    net_margin = pct_of_sales(net_total)
+    if net_margin is not None:
+        net_line += f"  ({net_margin:.1f}% margin)"
     if ad_spend is not None:
         adjusted = net_total - ad_spend
-        net_line += f"\n*Net after ad spend: {adjusted:,.2f} {currency}* (ad spend: {ad_spend:,.2f})"
+        adjusted_margin = pct_of_sales(adjusted)
+        net_line += f"\n*Net after ad spend: {adjusted:,.2f} {currency}*"
+        if adjusted_margin is not None:
+            net_line += f"  ({adjusted_margin:.1f}% margin)"
+        net_line += f" (ad spend: {ad_spend:,.2f})"
     else:
         net_line += "\n_(Ad spend not yet connected - Ads API access still pending)_"
     lines.append(net_line)
     lines.append("")
 
     def append_category_line(category, amount):
-        lines.append(f"• {category}: {amount:,.2f}")
+        pct = pct_of_sales(amount)
+        pct_text = f"  ({pct:.1f}% of sales)" if pct is not None else ""
+        lines.append(f"• {category}: {amount:,.2f}{pct_text}")
         if category in CATEGORIES_TO_EXPAND:
             subitems = category_subitems.get(category, {})
             for sub_label, sub_amount in sorted(subitems.items(), key=lambda kv: -abs(kv[1])):
                 lines.append(f"    - {sub_label}: {sub_amount:,.2f}")
 
-    lines.append("_Breakdown by category:_")
+    lines.append("_Breakdown by category (% of sales):_")
     for category in CATEGORY_DISPLAY_ORDER:
         if category in category_totals:
             append_category_line(category, category_totals[category])
@@ -471,11 +514,16 @@ def main():
         print(f"{today.date()} is not a report day. Nothing to do.")
         return
 
-    period_start, period_end, label = get_report_period(today, forced=(FORCE_RUN and today.weekday() != 0))
+    skip_state = FORCE_RUN or has_custom_range()
+
+    if has_custom_range():
+        period_start, period_end, label = get_custom_period()
+    else:
+        period_start, period_end, label = get_report_period(today, forced=(FORCE_RUN and today.weekday() != 0))
 
     state = load_state()
     period_key = period_end.strftime("%Y-%m-%d")
-    if not FORCE_RUN and state.get("last_reported_period_end") == period_key:
+    if not skip_state and state.get("last_reported_period_end") == period_key:
         print(f"Already reported for period ending {period_key}. Skipping.")
         return
 
@@ -494,7 +542,7 @@ def main():
     post_to_slack(message)
     print("Posted to Slack.")
 
-    if not FORCE_RUN:
+    if not skip_state:
         state["last_reported_period_end"] = period_key
         save_state(state)
 
