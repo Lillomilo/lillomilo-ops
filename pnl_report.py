@@ -362,6 +362,34 @@ def summarize_financial_events(events):
     return net_total, currency, category_totals, category_subitems
 
 
+def dump_shipment_principal_breakdown(events):
+    """
+    Isolates ONLY the "Principal" ChargeType amounts from ShipmentEventList
+    (the core per-order sale price, nothing else mixed in - no shipping, no
+    gift wrap, no tax, no fees) and prints one line per order: its
+    AmazonOrderId and its Principal total. This is meant to be compared
+    directly, order by order, against what Seller Central shows for the
+    same orders - the cleanest possible way to spot exactly where a
+    reconciliation gap is coming from.
+    """
+    shipment_events = events.get("ShipmentEventList", [])
+    print(f"\n===== Principal-only breakdown, {len(shipment_events)} ShipmentEventList order(s) =====")
+
+    grand_total = 0.0
+    for event in shipment_events:
+        order_id = event.get("AmazonOrderId", "(no order id)")
+        posted_date = event.get("PostedDate", "")
+        order_principal_total = 0.0
+        for amount, cur, type_hint, hint_source in find_currency_amounts(event):
+            if hint_source == "ChargeType" and (type_hint or "") == "Principal":
+                order_principal_total += amount
+        grand_total += order_principal_total
+        print(f"  {order_id} ({posted_date}): Principal = {order_principal_total:,.2f}")
+
+    print(f"  ---- TOTAL Principal across all orders: {grand_total:,.2f} ----")
+    print("===== END Principal-only breakdown =====\n")
+
+
 def dump_raw_events_for_debugging(events):
     """
     Prints the raw financial event data (and a per-list amount summary) to
@@ -369,6 +397,8 @@ def dump_raw_events_for_debugging(events):
     real data. Only ever printed to the GitHub Actions log, never sent to
     Slack.
     """
+    dump_shipment_principal_breakdown(events)
+
     total_events = sum(len(items) for items in events.values())
     print(f"\n===== DEBUG DUMP: {total_events} events across {len(events)} list types =====\n")
 
